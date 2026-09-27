@@ -4,6 +4,8 @@ import java.time.Instant;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
@@ -32,8 +34,11 @@ public class SchemaVersionEntity {
     @Column(nullable = false)
     private int version;
 
+    /**
+     * 可变契约载荷。受控删除后置空；摘要、版本号与审计时间戳继续保留。
+     */
     @Lob
-    @Column(nullable = false)
+    @Column(name = "content")
     private String content;
 
     @Column(name = "content_hash", nullable = false, length = 64)
@@ -41,6 +46,23 @@ public class SchemaVersionEntity {
 
     @Column(nullable = false)
     private Instant createdAt;
+
+    @Enumerated(EnumType.STRING)
+    @Column(name = "lifecycle", nullable = false, length = 32)
+    private VersionLifecycle lifecycle = VersionLifecycle.ACTIVE;
+
+    @Column(name = "deprecate_effective_at")
+    private Instant deprecateEffectiveAt;
+
+    @Column(name = "deprecated_at")
+    private Instant deprecatedAt;
+
+    @Column(name = "deleted_at")
+    private Instant deletedAt;
+
+    /** 删除保留期（毫秒），废弃时确定，删除后作为审计信息保留。 */
+    @Column(name = "retention_millis")
+    private Long retentionMillis;
 
     protected SchemaVersionEntity() {
     }
@@ -52,6 +74,7 @@ public class SchemaVersionEntity {
         this.content = content;
         this.contentHash = contentHash;
         this.createdAt = createdAt;
+        this.lifecycle = VersionLifecycle.ACTIVE;
     }
 
     public Long getId() {
@@ -76,5 +99,54 @@ public class SchemaVersionEntity {
 
     public Instant getCreatedAt() {
         return createdAt;
+    }
+
+    public VersionLifecycle getLifecycle() {
+        return lifecycle;
+    }
+
+    public void setLifecycle(VersionLifecycle lifecycle) {
+        this.lifecycle = lifecycle;
+    }
+
+    public Instant getDeprecateEffectiveAt() {
+        return deprecateEffectiveAt;
+    }
+
+    public void setDeprecateEffectiveAt(Instant deprecateEffectiveAt) {
+        this.deprecateEffectiveAt = deprecateEffectiveAt;
+    }
+
+    public Instant getDeprecatedAt() {
+        return deprecatedAt;
+    }
+
+    public void setDeprecatedAt(Instant deprecatedAt) {
+        this.deprecatedAt = deprecatedAt;
+    }
+
+    public Instant getDeletedAt() {
+        return deletedAt;
+    }
+
+    public void setDeletedAt(Instant deletedAt) {
+        this.deletedAt = deletedAt;
+    }
+
+    public Long getRetentionMillis() {
+        return retentionMillis;
+    }
+
+    public void setRetentionMillis(Long retentionMillis) {
+        this.retentionMillis = retentionMillis;
+    }
+
+    /**
+     * 执行受控删除：仅移除可变载荷，保留摘要、版本号与审计记录。
+     */
+    public void markTombstone(Instant deletedAt) {
+        this.content = null;
+        this.lifecycle = VersionLifecycle.TOMBSTONE;
+        this.deletedAt = deletedAt;
     }
 }

@@ -18,4 +18,8 @@ public interface SubjectRepository extends JpaRepository<SubjectEntity, Long> {
     @Lock(LockModeType.PESSIMISTIC_WRITE)
     @Query("select s from SubjectEntity s where s.name = :name")
     Optional<SubjectEntity> findByNameForUpdate(@Param("name") String name);
+
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Query("select s from SubjectEntity s where s.id = :id")
+    Optional<SubjectEntity> findByIdForUpdate(@Param("id") Long id);
 }
