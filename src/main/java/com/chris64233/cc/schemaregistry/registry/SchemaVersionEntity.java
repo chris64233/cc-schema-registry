@@ -4,6 +4,8 @@ import java.time.Instant;
 
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.FetchType;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
@@ -33,7 +35,7 @@ public class SchemaVersionEntity {
     private int version;
 
     @Lob
-    @Column(nullable = false)
+    @Column
     private String content;
 
     @Column(name = "content_hash", nullable = false, length = 64)
@@ -41,6 +43,28 @@ public class SchemaVersionEntity {
 
     @Column(nullable = false)
     private Instant createdAt;
+
+    @Enumerated(EnumType.STRING)
+    @Column(nullable = false)
+    private VersionLifecycle lifecycle = VersionLifecycle.ACTIVE;
+
+    @Column
+    private Instant deprecateEffectiveAt;
+
+    @Column
+    private Instant deprecatedAt;
+
+    @Column
+    private Long retentionSeconds;
+
+    @Column
+    private Instant deletedAt;
+
+    @Column
+    private String deprecationRequestKey;
+
+    @Column
+    private String deletionRequestKey;
 
     protected SchemaVersionEntity() {
     }
@@ -76,5 +100,69 @@ public class SchemaVersionEntity {
 
     public Instant getCreatedAt() {
         return createdAt;
+    }
+
+    public VersionLifecycle getLifecycle() {
+        return lifecycle;
+    }
+
+    public void setLifecycle(VersionLifecycle lifecycle) {
+        this.lifecycle = lifecycle;
+    }
+
+    public Instant getDeprecateEffectiveAt() {
+        return deprecateEffectiveAt;
+    }
+
+    public void setDeprecateEffectiveAt(Instant deprecateEffectiveAt) {
+        this.deprecateEffectiveAt = deprecateEffectiveAt;
+    }
+
+    public Instant getDeprecatedAt() {
+        return deprecatedAt;
+    }
+
+    public void setDeprecatedAt(Instant deprecatedAt) {
+        this.deprecatedAt = deprecatedAt;
+    }
+
+    public Long getRetentionSeconds() {
+        return retentionSeconds;
+    }
+
+    public void setRetentionSeconds(Long retentionSeconds) {
+        this.retentionSeconds = retentionSeconds;
+    }
+
+    public Instant getDeletedAt() {
+        return deletedAt;
+    }
+
+    public void setDeletedAt(Instant deletedAt) {
+        this.deletedAt = deletedAt;
+    }
+
+    public String getDeprecationRequestKey() {
+        return deprecationRequestKey;
+    }
+
+    public void setDeprecationRequestKey(String deprecationRequestKey) {
+        this.deprecationRequestKey = deprecationRequestKey;
+    }
+
+    public String getDeletionRequestKey() {
+        return deletionRequestKey;
+    }
+
+    public void setDeletionRequestKey(String deletionRequestKey) {
+        this.deletionRequestKey = deletionRequestKey;
+    }
+
+    public void clearContent() {
+        this.content = null;
+    }
+
+    public boolean isContentDeleted() {
+        return deletedAt != null;
     }
 }

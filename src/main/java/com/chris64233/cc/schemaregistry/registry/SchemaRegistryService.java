@@ -19,15 +19,17 @@ public class SchemaRegistryService {
     private final SubjectRepository subjects;
     private final SchemaVersionRepository versions;
     private final IdempotencyRecordRepository idempotencyRecords;
+    private final VersionAuditRepository audits;
     private final ContractParser contractParser;
     private final CompatibilityChecker compatibilityChecker;
 
     public SchemaRegistryService(SubjectRepository subjects, SchemaVersionRepository versions,
-            IdempotencyRecordRepository idempotencyRecords, ContractParser contractParser,
-            CompatibilityChecker compatibilityChecker) {
+            IdempotencyRecordRepository idempotencyRecords, VersionAuditRepository audits,
+            ContractParser contractParser, CompatibilityChecker compatibilityChecker) {
         this.subjects = subjects;
         this.versions = versions;
         this.idempotencyRecords = idempotencyRecords;
+        this.audits = audits;
         this.contractParser = contractParser;
         this.compatibilityChecker = compatibilityChecker;
     }
@@ -95,6 +97,8 @@ public class SchemaRegistryService {
         int nextVersion = versions.findMaxVersion(subject.getId()) + 1;
         versions.save(new SchemaVersionEntity(subject, nextVersion, contract.canonicalJson(), contentHash,
                 Instant.now()));
+        audits.save(new VersionAuditEntity(subject, nextVersion, VersionAuditEntity.Event.PUBLISHED,
+                "contentHash=" + contentHash, Instant.now()));
         if (idemKey != null) {
             idempotencyRecords.save(new IdempotencyRecordEntity(subject, idemKey, contentHash, nextVersion,
                     Instant.now()));
@@ -127,7 +131,10 @@ public class SchemaRegistryService {
     }
 
     private List<VersionedContract> historyOf(SubjectEntity subject) {
+        // 已删除载荷的版本不参与兼容性检查：其契约文本已不可恢复，
+        // 但版本号、内容哈希与审计记录仍然保留。
         return versions.findBySubjectIdOrderByVersionAsc(subject.getId()).stream()
+                .filter(v -> v.getContent() != null)
                 .map(v -> new VersionedContract(v.getVersion(), contractParser.parse(v.getContent())))
                 .toList();
     }

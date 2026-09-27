@@ -17,6 +17,10 @@ public interface SchemaVersionRepository extends JpaRepository<SchemaVersionEnti
 
     long countBySubjectId(Long subjectId);
 
+    long countBySubjectIdAndVersionGreaterThanAndDeletedAtIsNull(Long subjectId, int version);
+
+    List<SchemaVersionEntity> findBySubjectIdAndLifecycle(Long subjectId, VersionLifecycle lifecycle);
+
     @Query("select coalesce(max(v.version), 0) from SchemaVersionEntity v where v.subject.id = :subjectId")
     int findMaxVersion(@Param("subjectId") Long subjectId);
 }

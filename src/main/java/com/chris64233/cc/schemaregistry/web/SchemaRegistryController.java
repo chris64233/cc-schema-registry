@@ -70,7 +70,7 @@ public class SchemaRegistryController {
     @GetMapping("/{name}/versions/{version}")
     public Dto.VersionResponse getVersion(@PathVariable String name, @PathVariable int version) {
         SchemaVersionEntity entity = service.getVersion(name, version);
-        JsonNode contract = jsonMapper.readTree(entity.getContent());
+        JsonNode contract = entity.getContent() == null ? null : jsonMapper.readTree(entity.getContent());
         return new Dto.VersionResponse(name, entity.getVersion(), contract, entity.getContentHash(),
                 entity.getCreatedAt());
     }

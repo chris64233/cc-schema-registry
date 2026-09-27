@@ -9,6 +9,9 @@ public final class ErrorCodes {
     public static final String CONTRACT_INCOMPATIBLE = "CONTRACT_INCOMPATIBLE";
     public static final String IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT";
     public static final String INVALID_REQUEST = "INVALID_REQUEST";
+    public static final String VERSION_DEPRECATED = "VERSION_DEPRECATED";
+    public static final String VERSION_DELETED = "VERSION_DELETED";
+    public static final String DELETION_NOT_ELIGIBLE = "DELETION_NOT_ELIGIBLE";
 
     private ErrorCodes() {
     }
