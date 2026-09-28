@@ -13,6 +13,7 @@ import com.chris64233.cc.schemaregistry.contract.InvalidContractException;
 import com.chris64233.cc.schemaregistry.registry.ApiException;
 import com.chris64233.cc.schemaregistry.registry.ErrorCodes;
 import com.chris64233.cc.schemaregistry.registry.IncompatibleContractException;
+import com.chris64233.cc.schemaregistry.registry.MigrationIncompatibleException;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -33,6 +34,13 @@ public class GlobalExceptionHandler {
     public ResponseEntity<Dto.ErrorResponse> handleIncompatible(IncompatibleContractException ex) {
         return ResponseEntity.status(HttpStatus.UNPROCESSABLE_CONTENT)
                 .body(new Dto.ErrorResponse(ErrorCodes.CONTRACT_INCOMPATIBLE, ex.getMessage(), null, ex.diffs()));
+    }
+
+    @ExceptionHandler(MigrationIncompatibleException.class)
+    public ResponseEntity<Dto.ErrorResponse> handleMigrationIncompatible(MigrationIncompatibleException ex) {
+        return ResponseEntity.status(HttpStatus.UNPROCESSABLE_CONTENT)
+                .body(new Dto.ErrorResponse(ErrorCodes.MIGRATION_TARGET_INCOMPATIBLE, ex.getMessage(),
+                        ex.consumers(), ex.diffs()));
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

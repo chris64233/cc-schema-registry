@@ -38,6 +38,8 @@ public class SchemaRegistryService {
     private final OperationRequestRepository operationRequests;
     private final VersionAuditEventRepository auditEvents;
     private final CompatReferenceEdgeRepository compatEdges;
+    private final MigrationBatchRepository migrationBatches;
+    private final MigrationBatchService migrationBatchService;
     private final ContractParser contractParser;
     private final CompatibilityChecker compatibilityChecker;
     private final TimeProvider timeProvider;
@@ -45,7 +47,8 @@ public class SchemaRegistryService {
     public SchemaRegistryService(SubjectRepository subjects, SchemaVersionRepository versions,
             IdempotencyRecordRepository idempotencyRecords, ConsumerDependencyRepository dependencies,
             OperationRequestRepository operationRequests, VersionAuditEventRepository auditEvents,
-            CompatReferenceEdgeRepository compatEdges, ContractParser contractParser,
+            CompatReferenceEdgeRepository compatEdges, MigrationBatchRepository migrationBatches,
+            MigrationBatchService migrationBatchService, ContractParser contractParser,
             CompatibilityChecker compatibilityChecker, TimeProvider timeProvider) {
         this.subjects = subjects;
         this.versions = versions;
@@ -54,6 +57,8 @@ public class SchemaRegistryService {
         this.operationRequests = operationRequests;
         this.auditEvents = auditEvents;
         this.compatEdges = compatEdges;
+        this.migrationBatches = migrationBatches;
+        this.migrationBatchService = migrationBatchService;
         this.contractParser = contractParser;
         this.compatibilityChecker = compatibilityChecker;
         this.timeProvider = timeProvider;
@@ -358,22 +363,28 @@ public class SchemaRegistryService {
     }
 
     /**
-     * 扫描全部待废弃版本：生效时间已到且无有效消费者依赖的推进为已废弃。
-     * 每个主题按 id 顺序加悲观写锁，与消费者续租互斥，保证并发结果一致：
-     * 要么扫描先提交（依赖尚未续租，成功废弃），要么续租先提交（扫描看到有效依赖，保持待废弃）。
+     * 扫描全部待废弃版本与未完成迁移批次：先结算各主题 OPEN 批次（冻结成员租约过期/迁出
+     * 即完成批次并推动源版本进入废弃流程），再把生效时间已到且无有效消费者依赖的待废弃
+     * 版本推进为已废弃。每个主题按 id 顺序加悲观写锁，与消费者续租、迁移确认互斥，
+     * 保证并发结果一致：要么扫描先提交（依赖尚未续租/确认，成功结算），要么对方先提交
+     * （扫描看到有效依赖，成员保持待迁移、版本保持待废弃），不会漏掉仍活跃的源版本使用者。
      *
-     * @return 本次推进为已废弃的版本数量
+     * @return 本次完成的批次数与推进为已废弃的版本数
      */
     @Transactional
-    public int scanDeprecations() {
+    public ScanResult scanDeprecations() {
         Instant now = timeProvider.now();
-        List<Long> subjectIds = versions.findSubjectIdsWithLifecycle(VersionLifecycle.DEPRECATION_SCHEDULED);
+        java.util.Set<Long> subjectIds = new java.util.LinkedHashSet<>(
+                versions.findSubjectIdsWithLifecycle(VersionLifecycle.DEPRECATION_SCHEDULED));
+        subjectIds.addAll(migrationBatches.findSubjectIdsWithStatus(MigrationBatchStatus.OPEN));
         int transitions = 0;
+        int completedBatches = 0;
         for (Long subjectId : subjectIds) {
             SubjectEntity subject = subjects.findByIdForUpdate(subjectId).orElse(null);
             if (subject == null) {
                 continue;
             }
+            completedBatches += migrationBatchService.progressOpenBatches(subject, now);
             List<SchemaVersionEntity> scheduled =
                     versions.findBySubjectIdAndLifecycleOrderByVersionAsc(subjectId,
                             VersionLifecycle.DEPRECATION_SCHEDULED);
@@ -389,7 +400,7 @@ public class SchemaRegistryService {
                 }
             }
         }
-        return transitions;
+        return new ScanResult(transitions, completedBatches);
     }
 
     // ------------------------------------------------------------------
@@ -611,6 +622,9 @@ public class SchemaRegistryService {
 
     public record DeprecationResult(String subject, int version, VersionLifecycle lifecycle,
             Instant effectiveAt, Instant deprecatedAt, List<ConsumerView> blockingConsumers) {
+    }
+
+    public record ScanResult(int deprecatedVersions, int completedBatches) {
     }
 
     public record DeleteResult(String subject, int version, boolean deleted, Instant deletedAt,

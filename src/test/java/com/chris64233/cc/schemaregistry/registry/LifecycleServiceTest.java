@@ -213,14 +213,14 @@ class LifecycleServiceTest {
         assertThat(blocked.blockingConsumers()).extracting(ConsumerView::consumer).containsExactly("svc-a");
 
         // 生效时间已到，扫描仍被有效租约阻断
-        assertThat(service.scanDeprecations()).isZero();
+        assertThat(service.scanDeprecations().deprecatedVersions()).isZero();
         assertThat(service.getLifecycle("lc-block", 1).lifecycle())
                 .isEqualTo(VersionLifecycle.DEPRECATION_SCHEDULED);
 
         // 消费者迁移到 v2 后，扫描推进废弃
         service.registerConsumer("lc-block",
                 registration("svc-a", 2, 2, 1, null, clock.plusSeconds(200)));
-        assertThat(service.scanDeprecations()).isEqualTo(1);
+        assertThat(service.scanDeprecations().deprecatedVersions()).isEqualTo(1);
         assertThat(service.getLifecycle("lc-block", 1).lifecycle())
                 .isEqualTo(VersionLifecycle.DEPRECATED);
     }
@@ -233,10 +233,10 @@ class LifecycleServiceTest {
         service.requestDeprecation("lc-lease", 1, clock.plusSeconds(10), null, null);
 
         clock.advanceSeconds(30);
-        assertThat(service.scanDeprecations()).isZero(); // 租约仍有效
+        assertThat(service.scanDeprecations().deprecatedVersions()).isZero(); // 租约仍有效
 
         clock.advanceSeconds(30);
-        assertThat(service.scanDeprecations()).isEqualTo(1); // 租约过期
+        assertThat(service.scanDeprecations().deprecatedVersions()).isEqualTo(1); // 租约过期
         assertThat(service.getLifecycle("lc-lease", 1).lifecycle())
                 .isEqualTo(VersionLifecycle.DEPRECATED);
     }
@@ -248,9 +248,9 @@ class LifecycleServiceTest {
                 null, null);
         assertThat(scheduled.lifecycle()).isEqualTo(VersionLifecycle.DEPRECATION_SCHEDULED);
 
-        assertThat(service.scanDeprecations()).isZero();
+        assertThat(service.scanDeprecations().deprecatedVersions()).isZero();
         clock.advanceSeconds(101);
-        assertThat(service.scanDeprecations()).isEqualTo(1);
+        assertThat(service.scanDeprecations().deprecatedVersions()).isEqualTo(1);
         assertThat(service.getLifecycle("lc-future", 1).lifecycle()).isEqualTo(VersionLifecycle.DEPRECATED);
     }
 

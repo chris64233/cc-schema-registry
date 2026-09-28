@@ -140,7 +140,8 @@ public class SchemaRegistryController {
 
     @PostMapping("/deprecation-scans")
     public Dto.ScanResponse scanDeprecations() {
-        return new Dto.ScanResponse(service.scanDeprecations());
+        SchemaRegistryService.ScanResult result = service.scanDeprecations();
+        return new Dto.ScanResponse(result.deprecatedVersions(), result.completedBatches());
     }
 
     private Dto.SubjectResponse toSubjectResponse(SubjectEntity subject) {
