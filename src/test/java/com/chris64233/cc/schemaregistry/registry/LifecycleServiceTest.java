@@ -57,7 +57,8 @@ class LifecycleServiceTest {
     void setUp() {
         // 全局扫描会触及全部主题，逐测试清空数据避免相互干扰。
         jdbcTemplate.execute("SET REFERENTIAL_INTEGRITY FALSE");
-        for (String table : List.of("compat_reference_edges", "version_audit_events", "operation_requests",
+        for (String table : List.of("migration_confirmations", "migration_batch_members",
+                "migration_batches", "compat_reference_edges", "version_audit_events", "operation_requests",
                 "consumer_dependencies", "idempotency_records", "schema_versions", "subjects")) {
             jdbcTemplate.execute("TRUNCATE TABLE " + table);
         }

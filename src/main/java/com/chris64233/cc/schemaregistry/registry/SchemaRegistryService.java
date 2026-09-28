@@ -27,6 +27,11 @@ public class SchemaRegistryService {
     static final String AUDIT_DEPRECATED = "DEPRECATED";
     static final String AUDIT_DELETE_REQUESTED = "DELETE_REQUESTED";
     static final String AUDIT_DELETED = "DELETED";
+    static final String AUDIT_MIGRATION_BATCH_CREATED = "MIGRATION_BATCH_CREATED";
+    static final String AUDIT_MIGRATION_CONFIRMED = "MIGRATION_CONFIRMED";
+    static final String AUDIT_MIGRATION_BATCH_COMPLETED = "MIGRATION_BATCH_COMPLETED";
+    static final String AUDIT_MIGRATION_BATCH_CANCELLED = "MIGRATION_BATCH_CANCELLED";
+    static final String AUDIT_MIGRATION_MEMBER_RESOLVED = "MIGRATION_MEMBER_RESOLVED";
 
     /** 删除保留期默认值：废弃生效后 30 天。 */
     static final long DEFAULT_RETENTION_MILLIS = Duration.ofDays(30).toMillis();
@@ -38,6 +43,9 @@ public class SchemaRegistryService {
     private final OperationRequestRepository operationRequests;
     private final VersionAuditEventRepository auditEvents;
     private final CompatReferenceEdgeRepository compatEdges;
+    private final MigrationBatchRepository migrationBatches;
+    private final MigrationBatchMemberRepository migrationMembers;
+    private final MigrationConfirmationRepository migrationConfirmations;
     private final ContractParser contractParser;
     private final CompatibilityChecker compatibilityChecker;
     private final TimeProvider timeProvider;
@@ -45,7 +53,9 @@ public class SchemaRegistryService {
     public SchemaRegistryService(SubjectRepository subjects, SchemaVersionRepository versions,
             IdempotencyRecordRepository idempotencyRecords, ConsumerDependencyRepository dependencies,
             OperationRequestRepository operationRequests, VersionAuditEventRepository auditEvents,
-            CompatReferenceEdgeRepository compatEdges, ContractParser contractParser,
+            CompatReferenceEdgeRepository compatEdges, MigrationBatchRepository migrationBatches,
+            MigrationBatchMemberRepository migrationMembers,
+            MigrationConfirmationRepository migrationConfirmations, ContractParser contractParser,
             CompatibilityChecker compatibilityChecker, TimeProvider timeProvider) {
         this.subjects = subjects;
         this.versions = versions;
@@ -54,6 +64,9 @@ public class SchemaRegistryService {
         this.operationRequests = operationRequests;
         this.auditEvents = auditEvents;
         this.compatEdges = compatEdges;
+        this.migrationBatches = migrationBatches;
+        this.migrationMembers = migrationMembers;
+        this.migrationConfirmations = migrationConfirmations;
         this.contractParser = contractParser;
         this.compatibilityChecker = compatibilityChecker;
         this.timeProvider = timeProvider;
@@ -358,21 +371,35 @@ public class SchemaRegistryService {
     }
 
     /**
-     * 扫描全部待废弃版本：生效时间已到且无有效消费者依赖的推进为已废弃。
-     * 每个主题按 id 顺序加悲观写锁，与消费者续租互斥，保证并发结果一致：
-     * 要么扫描先提交（依赖尚未续租，成功废弃），要么续租先提交（扫描看到有效依赖，保持待废弃）。
+     * 扫描全部待废弃版本与进行中的迁移批次：
+     * <ol>
+     *   <li>先按主题推进迁移批次：剔除租约过期的冻结成员，冻结集合全部解决则完成批次并推进源版本；</li>
+     *   <li>再推进待废弃版本：生效时间已到且无有效消费者依赖的进入已废弃。</li>
+     * </ol>
+     * 每个主题按 id 顺序加悲观写锁，与消费者续租、迁移确认互斥，保证并发结果一致：
+     * 要么扫描先提交（依赖尚未续租，成员被剔除/版本废弃），要么续租先提交（扫描看到有效依赖）。
      *
      * @return 本次推进为已废弃的版本数量
      */
     @Transactional
     public int scanDeprecations() {
         Instant now = timeProvider.now();
-        List<Long> subjectIds = versions.findSubjectIdsWithLifecycle(VersionLifecycle.DEPRECATION_SCHEDULED);
+        java.util.TreeSet<Long> subjectIds = new java.util.TreeSet<>();
+        subjectIds.addAll(versions.findSubjectIdsWithLifecycle(VersionLifecycle.DEPRECATION_SCHEDULED));
+        subjectIds.addAll(migrationBatches.findSubjectIdsWithInProgressBatches());
         int transitions = 0;
         for (Long subjectId : subjectIds) {
             SubjectEntity subject = subjects.findByIdForUpdate(subjectId).orElse(null);
             if (subject == null) {
                 continue;
+            }
+            // 先推进迁移批次，可能在同事务内把源版本推进为已废弃。
+            List<MigrationBatchEntity> inProgress = migrationBatches
+                    .findBySubjectIdAndStatusOrderByBatchNoAsc(subjectId, MigrationBatchStatus.IN_PROGRESS);
+            for (MigrationBatchEntity batch : inProgress) {
+                if (tryCompleteBatch(subject, batch, now)) {
+                    transitions++;
+                }
             }
             List<SchemaVersionEntity> scheduled =
                     versions.findBySubjectIdAndLifecycleOrderByVersionAsc(subjectId,
@@ -390,6 +417,439 @@ public class SchemaRegistryService {
             }
         }
         return transitions;
+    }
+
+    // ------------------------------------------------------------------
+    // 消费者迁移批次
+    // ------------------------------------------------------------------
+
+    /**
+     * 创建迁移批次：绑定同一主题的源版本与目标版本，并冻结当前仍在使用源版本的有效消费者集合。
+     * 全部前置条件必须同时满足，任何一条不满足都整体拒绝，不会产生部分可执行的批次：
+     * <ul>
+     *   <li>源、目标版本均存在，源版本不是墓碑，目标版本可用（未废弃/删除）；</li>
+     *   <li>源 ≠ 目标；</li>
+     *   <li>同一源版本不存在另一个进行中的批次；</li>
+     *   <li>源版本当前至少有一个有效消费者（否则冻结集合为空）；</li>
+     *   <li>目标契约与每个冻结消费者当前使用的源版本之间满足主题兼容策略——冻结成员都在源版本上，
+     *       即目标契约对源版本通过兼容性检查；不满足时返回确定性差异列表（{@code CONTRACT_INCOMPATIBLE}）。</li>
+     * </ul>
+     * 整个创建在主题悲观写锁内完成。幂等键非空时按（主题、键）幂等。
+     */
+    @Transactional
+    public MigrationBatchCreation createMigrationBatch(String subjectName, MigrationBatchRequest request) {
+        SubjectEntity subject = lockSubject(subjectName);
+        Instant now = timeProvider.now();
+        String idemKey = normalizeKey(request.idempotencyKey());
+
+        if (request.sourceVersion() == request.targetVersion()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, ErrorCodes.INVALID_REQUEST,
+                    "source version and target version must differ");
+        }
+
+        if (idemKey != null) {
+            var prior = migrationBatches.findBySubjectIdAndIdempotencyKey(subject.getId(), idemKey);
+            if (prior.isPresent()) {
+                MigrationBatchEntity existing = prior.get();
+                if (existing.getSourceVersion() != request.sourceVersion()
+                        || existing.getTargetVersion() != request.targetVersion()) {
+                    throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.IDEMPOTENCY_CONFLICT,
+                            "migration batch idempotency key '" + idemKey
+                                    + "' was used with different source/target versions");
+                }
+                return new MigrationBatchCreation(toBatchView(existing), false);
+            }
+        }
+
+        SchemaVersionEntity source = mustFindVersion(subject, subjectName, request.sourceVersion());
+        SchemaVersionEntity target = mustFindVersion(subject, subjectName, request.targetVersion());
+        if (source.getLifecycle() == VersionLifecycle.TOMBSTONE) {
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.LIFECYCLE_CONFLICT,
+                    "source version " + source.getVersion()
+                            + " has been deleted (tombstone) and cannot be migrated away from");
+        }
+        if (target.getLifecycle() != VersionLifecycle.ACTIVE
+                && target.getLifecycle() != VersionLifecycle.DEPRECATION_SCHEDULED) {
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.LIFECYCLE_CONFLICT,
+                    "target version " + target.getVersion() + " is " + target.getLifecycle()
+                            + " and is not available as a migration target");
+        }
+        if (migrationBatches.existsBySubjectIdAndSourceVersionAndStatus(subject.getId(),
+                source.getVersion(), MigrationBatchStatus.IN_PROGRESS)) {
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.LIFECYCLE_CONFLICT,
+                    "an in-progress migration batch for source version " + source.getVersion()
+                            + " already exists");
+        }
+
+        List<ConsumerDependencyEntity> active =
+                dependencies.findActiveByVersion(subject.getId(), source.getVersion(), now);
+        if (active.isEmpty()) {
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.MIGRATION_NO_ACTIVE_CONSUMERS,
+                    "version " + source.getVersion()
+                            + " has no active consumers; nothing to freeze into a migration batch");
+        }
+
+        // 目标版本必须与每个冻结消费者当前使用的版本（即源版本）满足主题兼容策略。
+        ObjectContract targetContract = contractParser.parse(target.getContent());
+        List<CompatibilityDiff> diffs = compatibilityChecker.check(subject.getCompatibility(), targetContract,
+                List.of(new VersionedContract(source.getVersion(), contractParser.parse(source.getContent()))));
+        if (!diffs.isEmpty()) {
+            throw new IncompatibleContractException(diffs);
+        }
+
+        int batchNo = migrationBatches.findMaxBatchNo(subject.getId()) + 1;
+        MigrationBatchEntity batch = new MigrationBatchEntity(subject, batchNo, source.getVersion(),
+                target.getVersion(), idemKey, now);
+        migrationBatches.save(batch);
+        // 冻结：对创建时刻仍在使用源版本的有效消费者集合拍快照。
+        for (ConsumerDependencyEntity d : active) {
+            migrationMembers.save(new MigrationBatchMemberEntity(batch, subject, d.getConsumer(),
+                    d.getContractVersion(), d.getLeaseExpiresAt()));
+        }
+        auditEvents.save(new VersionAuditEventEntity(subject, source.getVersion(),
+                AUDIT_MIGRATION_BATCH_CREATED, idemKey,
+                "migration batch " + batchNo + ": version " + source.getVersion() + " -> "
+                        + target.getVersion() + ", froze " + active.size() + " consumer(s) "
+                        + active.stream().map(ConsumerDependencyEntity::getConsumer).sorted().toList(),
+                now));
+        return new MigrationBatchCreation(toBatchView(batch), true);
+    }
+
+    /**
+     * 消费者以唯一迁移事件确认已切换到批次目标版本。确认必须：
+     * <ul>
+     *   <li>携带主题内唯一的事件号，重复事件保持幂等（返回首次确认结果）；</li>
+     *   <li>批次存在且仍在进行中；</li>
+     *   <li>消费者在批次冻结集合内，且确认的目标版本等于批次目标版本；</li>
+     *   <li>消费者当前登记版本必须是源版本：迟到的旧批次确认不能覆盖消费者后来登记的版本；
+     *       未列入冻结集合的消费者也不能借此改变依赖关系。</li>
+     * </ul>
+     * 确认把消费者依赖 compare-and-set 到目标版本（沿用其更新号与租约），并尝试完成批次。
+     */
+    @Transactional
+    public MigrationBatchView confirmMigration(String subjectName, int batchNo,
+            MigrationConfirmationRequest request) {
+        SubjectEntity subject = lockSubject(subjectName);
+        Instant now = timeProvider.now();
+        String eventId = requireEventId(request.eventId());
+
+        MigrationBatchEntity batch = mustFindBatch(subject, subjectName, batchNo);
+
+        MigrationConfirmationEntity byEvent =
+                migrationConfirmations.findBySubjectIdAndEventId(subject.getId(), eventId).orElse(null);
+        if (byEvent != null) {
+            if (byEvent.getBatch().getId().equals(batch.getId())
+                    && byEvent.getConsumer().equals(request.consumer())
+                    && byEvent.getTargetVersion() == batch.getTargetVersion()) {
+                return toBatchView(batch);
+            }
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.IDEMPOTENCY_CONFLICT,
+                    "migration event id '" + eventId + "' was already used for another confirmation");
+        }
+
+        if (batch.getStatus() != MigrationBatchStatus.IN_PROGRESS) {
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.MIGRATION_BATCH_CLOSED,
+                    "migration batch " + batchNo + " is " + batch.getStatus()
+                            + " and no longer accepts confirmations");
+        }
+        if (request.targetVersion() != null && request.targetVersion() != batch.getTargetVersion()) {
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.MIGRATION_MISMATCH,
+                    "confirmation target version " + request.targetVersion()
+                            + " does not match batch target version " + batch.getTargetVersion());
+        }
+
+        MigrationBatchMemberEntity member = migrationMembers
+                .findByBatchIdAndConsumer(batch.getId(), request.consumer())
+                .orElseThrow(() -> new ApiException(HttpStatus.CONFLICT, ErrorCodes.MIGRATION_MISMATCH,
+                        "consumer '" + request.consumer()
+                                + "' is not in the frozen set of batch " + batchNo
+                                + "; it cannot alter its dependency via this batch"));
+        if (member.getStatus() != MigrationMemberStatus.PENDING) {
+            // 同一消费者在此批次上已有确认（但事件号不同）：历史不可修改。
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.MIGRATION_ALREADY_CONFIRMED,
+                    "consumer '" + request.consumer() + "' is already " + member.getStatus()
+                            + " in batch " + batchNo);
+        }
+
+        ConsumerDependencyEntity dependency = dependencies
+                .findBySubjectIdAndConsumer(subject.getId(), request.consumer())
+                .orElseThrow(() -> new ApiException(HttpStatus.CONFLICT, ErrorCodes.MIGRATION_VERSION_CONFLICT,
+                        "consumer '" + request.consumer()
+                                + "' has no registered dependency; a batch confirmation cannot create one"));
+        if (dependency.getContractVersion() != batch.getSourceVersion()) {
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.MIGRATION_VERSION_CONFLICT,
+                    "consumer '" + request.consumer() + "' is now registered on version "
+                            + dependency.getContractVersion() + ", not batch source version "
+                            + batch.getSourceVersion()
+                            + "; a late confirmation cannot overwrite the newer dependency");
+        }
+        SchemaVersionEntity target = mustFindVersion(subject, subjectName, batch.getTargetVersion());
+        if (target.getLifecycle() == VersionLifecycle.DEPRECATED
+                || target.getLifecycle() == VersionLifecycle.TOMBSTONE) {
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.LIFECYCLE_CONFLICT,
+                    "target version " + target.getVersion() + " is " + target.getLifecycle()
+                            + " and cannot receive consumer registrations");
+        }
+
+        migrationConfirmations.save(new MigrationConfirmationEntity(subject, batch, eventId,
+                request.consumer(), batch.getTargetVersion(), now));
+        // CAS 到目标版本：沿用更新号与现有租约，因此不会把租约意外延长。
+        dependency.apply(batch.getTargetVersion(), dependency.getLeaseExpiresAt(),
+                dependency.getUpdateSeq(), now);
+        member.resolve(MigrationMemberStatus.CONFIRMED, now);
+        auditEvents.save(new VersionAuditEventEntity(subject, batch.getSourceVersion(),
+                AUDIT_MIGRATION_CONFIRMED, eventId,
+                "batch " + batchNo + ": consumer '" + request.consumer() + "' confirmed switch to version "
+                        + batch.getTargetVersion(),
+                now));
+
+        tryCompleteBatch(subject, batch, now);
+        return toBatchView(mustFindBatch(subject, subjectName, batchNo));
+    }
+
+    /**
+     * 在批次完成前取消。取消只停止后续迁移推进（此后确认被拒绝），不回退已经确认的消费者版本，
+     * 也不改变冻结快照。重复取消（已取消）按幂等返回当前状态；取消已完成批次被拒绝。
+     */
+    @Transactional
+    public MigrationBatchView cancelMigrationBatch(String subjectName, int batchNo) {
+        SubjectEntity subject = lockSubject(subjectName);
+        Instant now = timeProvider.now();
+        MigrationBatchEntity batch = mustFindBatch(subject, subjectName, batchNo);
+        if (batch.getStatus() == MigrationBatchStatus.CANCELLED) {
+            return toBatchView(batch);
+        }
+        if (batch.getStatus() == MigrationBatchStatus.COMPLETED) {
+            throw new ApiException(HttpStatus.CONFLICT, ErrorCodes.MIGRATION_BATCH_CLOSED,
+                    "migration batch " + batchNo + " is already COMPLETED and cannot be cancelled");
+        }
+        batch.markCancelled(now);
+        auditEvents.save(new VersionAuditEventEntity(subject, batch.getSourceVersion(),
+                AUDIT_MIGRATION_BATCH_CANCELLED, null,
+                "batch " + batchNo + " cancelled; confirmed consumer versions are not rolled back", now));
+        return toBatchView(batch);
+    }
+
+    @Transactional(readOnly = true)
+    public List<MigrationBatchView> listMigrationBatches(String subjectName) {
+        SubjectEntity subject = subjects.findByName(subjectName)
+                .orElseThrow(() -> subjectNotFound(subjectName));
+        return migrationBatches.findBySubjectIdOrderByBatchNoAsc(subject.getId()).stream()
+                .map(this::toBatchView)
+                .toList();
+    }
+
+    @Transactional(readOnly = true)
+    public MigrationBatchView getMigrationBatch(String subjectName, int batchNo) {
+        SubjectEntity subject = subjects.findByName(subjectName)
+                .orElseThrow(() -> subjectNotFound(subjectName));
+        return toBatchView(mustFindBatch(subject, subjectName, batchNo));
+    }
+
+    /**
+     * 尝试完成进行中的批次。进行中时按当前依赖实时判定每个 PENDING 成员：
+     * 租约已过期或依赖记录消失 → LEASE_EXPIRED；当前版本不是源版本（自行改登记）→ RELOCATED。
+     * 当冻结集合中不再存在源版本的活跃使用者时，批次完成并推进源版本进入原有废弃流程。
+     *
+     * @return 源版本是否在本次尝试中进入已废弃
+     */
+    private boolean tryCompleteBatch(SubjectEntity subject, MigrationBatchEntity batch, Instant now) {
+        if (batch.getStatus() != MigrationBatchStatus.IN_PROGRESS) {
+            return false;
+        }
+        List<MigrationBatchMemberEntity> members =
+                migrationMembers.findByBatchIdOrderByConsumerAsc(batch.getId());
+        for (MigrationBatchMemberEntity member : members) {
+            if (member.getStatus() != MigrationMemberStatus.PENDING) {
+                continue;
+            }
+            MigrationMemberStatus liveStatus = migrationMemberStatus(member, subject, now);
+            if (liveStatus == MigrationMemberStatus.PENDING) {
+                continue;
+            }
+            ConsumerDependencyEntity dependency =
+                    dependencies.findBySubjectIdAndConsumer(subject.getId(), member.getConsumer()).orElse(null);
+            String detail;
+            if (liveStatus == MigrationMemberStatus.LEASE_EXPIRED) {
+                detail = "removed from batch " + batch.getBatchNo() + " after lease expiry (lease was "
+                        + (dependency != null ? dependency.getLeaseExpiresAt()
+                                : member.getFrozenLeaseExpiresAt())
+                        + ")";
+            } else {
+                detail = "left batch " + batch.getBatchNo() + " by re-registering on version "
+                        + (dependency != null ? dependency.getContractVersion() : "?");
+            }
+            member.resolve(liveStatus, now);
+            auditEvents.save(new VersionAuditEventEntity(subject, batch.getSourceVersion(),
+                    AUDIT_MIGRATION_MEMBER_RESOLVED, null, "consumer '" + member.getConsumer() + "' " + detail,
+                    now));
+        }
+
+        // 完成判定只看冻结集合的当前真实依赖，不能把仍活跃的源版本使用者漏掉。
+        boolean stillActive = members.stream()
+                .anyMatch(m -> migrationMemberStatus(m, subject, now) == MigrationMemberStatus.PENDING);
+        if (stillActive) {
+            return false;
+        }
+        batch.markCompleted(now);
+        auditEvents.save(new VersionAuditEventEntity(subject, batch.getSourceVersion(),
+                AUDIT_MIGRATION_BATCH_COMPLETED, null,
+                "batch " + batch.getBatchNo() + " completed; all frozen consumers resolved", now));
+        return advanceSourceAfterBatch(subject, batch, now);
+    }
+
+    /**
+     * 批次完成后推动源版本进入原有废弃流程：ACTIVE 源版本立即登记废弃（生效时间为当前时刻）；
+     * 只要当前不存在源版本的有效消费者（含冻结集合外后来登记的消费者），就在同事务内推进为已废弃。
+     */
+    private boolean advanceSourceAfterBatch(SubjectEntity subject, MigrationBatchEntity batch, Instant now) {
+        SchemaVersionEntity source =
+                versions.findBySubjectIdAndVersion(subject.getId(), batch.getSourceVersion()).orElse(null);
+        if (source == null || source.getLifecycle() == VersionLifecycle.TOMBSTONE
+                || source.getLifecycle() == VersionLifecycle.DEPRECATED) {
+            return false;
+        }
+        if (source.getLifecycle() == VersionLifecycle.ACTIVE) {
+            source.setLifecycle(VersionLifecycle.DEPRECATION_SCHEDULED);
+            source.setDeprecateEffectiveAt(now);
+            if (source.getRetentionMillis() == null) {
+                source.setRetentionMillis(DEFAULT_RETENTION_MILLIS);
+            }
+            auditEvents.save(new VersionAuditEventEntity(subject, source.getVersion(),
+                    AUDIT_DEPRECATION_REQUESTED, null,
+                    "auto-scheduled by completion of migration batch " + batch.getBatchNo(), now));
+        }
+        // 原有废弃流程的门槛仍然适用：生效时间未到或冻结集合外仍有活跃使用者时，保持待废弃，
+        // 由废弃扫描在条件满足后推进。
+        if (now.isBefore(source.getDeprecateEffectiveAt())) {
+            return false;
+        }
+        List<ConsumerView> blockers = activeConsumersOf(subject, source.getVersion());
+        if (!blockers.isEmpty()) {
+            return false;
+        }
+        source.setLifecycle(VersionLifecycle.DEPRECATED);
+        source.setDeprecatedAt(now);
+        auditEvents.save(new VersionAuditEventEntity(subject, source.getVersion(), AUDIT_DEPRECATED, null,
+                "migration batch " + batch.getBatchNo() + " completed with no active consumers", now));
+        return true;
+    }
+
+    /**
+     * 组装批次视图。进行中成员状态按当前依赖实时计算；已完成/已取消成员使用固化状态。
+     * 同时给出源版本当前仍不能废弃的原因。
+     */
+    private MigrationBatchView toBatchView(MigrationBatchEntity batch) {
+        Instant now = timeProvider.now();
+        Long subjectId = batch.getSubject().getId();
+        String subjectName = batch.getSubject().getName();
+        List<MigrationBatchMemberEntity> stored =
+                migrationMembers.findByBatchIdOrderByConsumerAsc(batch.getId());
+
+        List<MemberView> pending = new ArrayList<>();
+        List<MemberView> confirmed = new ArrayList<>();
+        List<MemberView> removed = new ArrayList<>();
+        for (MigrationBatchMemberEntity m : stored) {
+            MigrationMemberStatus status = migrationMemberStatus(m, batch.getSubject(), now);
+            ConsumerDependencyEntity d =
+                    dependencies.findBySubjectIdAndConsumer(subjectId, m.getConsumer()).orElse(null);
+            int currentVersion = d != null ? d.getContractVersion() : m.getFrozenVersion();
+            Instant leaseExpiresAt = d != null ? d.getLeaseExpiresAt() : m.getFrozenLeaseExpiresAt();
+            MemberView view = new MemberView(m.getConsumer(), m.getFrozenVersion(), currentVersion,
+                    leaseExpiresAt, status, m.getResolvedAt());
+            switch (status) {
+                case CONFIRMED -> confirmed.add(view);
+                case PENDING -> pending.add(view);
+                default -> removed.add(view);
+            }
+        }
+
+        List<ConfirmationView> confirmations = confirmationsOf(batch, stored).stream()
+                .map(c -> new ConfirmationView(c.getConsumer(), c.getTargetVersion(), c.getEventId(),
+                        c.getConfirmedAt()))
+                .sorted(java.util.Comparator.comparing(ConfirmationView::consumer))
+                .toList();
+
+        SchemaVersionEntity source =
+                versions.findBySubjectIdAndVersion(subjectId, batch.getSourceVersion()).orElse(null);
+        List<String> sourceBlockReasons =
+                source != null ? sourceDeprecationBlockReasons(batch.getSubject(), source, now) : List.of();
+
+        return new MigrationBatchView(subjectName, batch.getBatchNo(), batch.getSourceVersion(),
+                batch.getTargetVersion(), batch.getStatus(), batch.getCreatedAt(), batch.getCompletedAt(),
+                batch.getCancelledAt(), List.copyOf(pending), List.copyOf(confirmed), List.copyOf(removed),
+                confirmations, List.copyOf(sourceBlockReasons));
+    }
+
+    /** 确认历史与冻结成员一一对应，按成员（消费者）顺序收集以保持确定性。 */
+    private List<MigrationConfirmationEntity> confirmationsOf(MigrationBatchEntity batch,
+            List<MigrationBatchMemberEntity> members) {
+        List<MigrationConfirmationEntity> result = new ArrayList<>();
+        for (MigrationBatchMemberEntity m : members) {
+            migrationConfirmations.findByBatchIdAndConsumer(batch.getId(), m.getConsumer())
+                    .ifPresent(result::add);
+        }
+        return result;
+    }
+
+    /** 进行中批次的 PENDING 成员按当前依赖实时归类；其它情况返回固化状态。 */
+    private MigrationMemberStatus migrationMemberStatus(MigrationBatchMemberEntity member,
+            SubjectEntity subject, Instant now) {
+        if (member.getStatus() != MigrationMemberStatus.PENDING) {
+            return member.getStatus();
+        }
+        if (member.getBatch().getStatus() != MigrationBatchStatus.IN_PROGRESS) {
+            return MigrationMemberStatus.PENDING;
+        }
+        ConsumerDependencyEntity d =
+                dependencies.findBySubjectIdAndConsumer(subject.getId(), member.getConsumer()).orElse(null);
+        if (d != null && d.getLeaseExpiresAt().isAfter(now)) {
+            return d.getContractVersion() == member.getBatch().getSourceVersion()
+                    ? MigrationMemberStatus.PENDING
+                    : MigrationMemberStatus.RELOCATED;
+        }
+        return MigrationMemberStatus.LEASE_EXPIRED;
+    }
+
+    /** 源版本当前仍不能进入已废弃的原因（始终按当前依赖与批次状态实时计算）。 */
+    private List<String> sourceDeprecationBlockReasons(SubjectEntity subject, SchemaVersionEntity source,
+            Instant now) {
+        List<String> reasons = new ArrayList<>();
+        switch (source.getLifecycle()) {
+            case ACTIVE -> reasons.add("source version " + source.getVersion()
+                    + " is still ACTIVE; it will be scheduled for deprecation when the batch completes");
+            case TOMBSTONE -> reasons.add("source version " + source.getVersion() + " has been deleted");
+            case DEPRECATED -> {
+                // 已进入已废弃，无阻断原因。
+            }
+            case DEPRECATION_SCHEDULED -> {
+                if (now.isBefore(source.getDeprecateEffectiveAt())) {
+                    reasons.add("deprecation not yet effective (effective at "
+                            + source.getDeprecateEffectiveAt() + ")");
+                }
+                List<ConsumerView> active = activeConsumersOf(subject, source.getVersion());
+                if (!active.isEmpty()) {
+                    reasons.add("active consumers still using version " + source.getVersion() + ": "
+                            + active.stream().map(ConsumerView::consumer).sorted().toList());
+                }
+            }
+        }
+        return List.copyOf(reasons);
+    }
+
+    private MigrationBatchEntity mustFindBatch(SubjectEntity subject, String subjectName, int batchNo) {
+        return migrationBatches.findBySubjectIdAndBatchNo(subject.getId(), batchNo)
+                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND,
+                        ErrorCodes.MIGRATION_BATCH_NOT_FOUND,
+                        "subject '" + subjectName + "' has no migration batch " + batchNo));
+    }
+
+    private static String requireEventId(String eventId) {
+        if (eventId == null || eventId.isBlank()) {
+            throw new ApiException(HttpStatus.BAD_REQUEST, ErrorCodes.INVALID_REQUEST,
+                    "eventId must not be blank");
+        }
+        return eventId;
     }
 
     // ------------------------------------------------------------------
@@ -632,5 +1092,44 @@ public class SchemaRegistryService {
             String contentHash, List<ConsumerView> blockingConsumers,
             CompatReferenceView compatibilityReferences, DeleteEligibility deleteEligibility,
             List<AuditView> audit) {
+    }
+
+    public record MigrationBatchRequest(int sourceVersion, int targetVersion, String idempotencyKey) {
+    }
+
+    public record MigrationBatchCreation(MigrationBatchView batch, boolean created) {
+    }
+
+    public record MigrationConfirmationRequest(String consumer, String eventId, Integer targetVersion) {
+    }
+
+    /**
+     * @param status            成员状态：PENDING / CONFIRMED / LEASE_EXPIRED / RELOCATED
+     * @param currentVersion    消费者当前登记版本（记录消失时回退为冻结版本）
+     * @param leaseExpiresAt    当前租约到期时间（记录消失时回退为冻结租约）
+     * @param resolvedAt        状态固化时间；进行中实时判定的状态为 null
+     */
+    public record MemberView(String consumer, int frozenVersion, int currentVersion,
+            Instant leaseExpiresAt, MigrationMemberStatus status, Instant resolvedAt) {
+    }
+
+    public record ConfirmationView(String consumer, int targetVersion, String eventId,
+            Instant confirmedAt) {
+    }
+
+    /**
+     * 迁移批次视图：
+     *
+     * @param pendingConsumers    仍待迁移的冻结消费者
+     * @param confirmedConsumers  已确认项（与 {@code confirmations} 对应）
+     * @param removedConsumers    因租约过期移除或自行改登记的项
+     * @param confirmations       只追加、不可修改的确认历史
+     * @param sourceBlockReasons  源版本当前仍不能废弃的原因（为空表示无阻断）
+     */
+    public record MigrationBatchView(String subject, int batchNo, int sourceVersion, int targetVersion,
+            MigrationBatchStatus status, Instant createdAt, Instant completedAt, Instant cancelledAt,
+            List<MemberView> pendingConsumers, List<MemberView> confirmedConsumers,
+            List<MemberView> removedConsumers, List<ConfirmationView> confirmations,
+            List<String> sourceBlockReasons) {
     }
 }

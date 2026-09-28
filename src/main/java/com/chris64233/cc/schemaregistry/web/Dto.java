@@ -8,6 +8,8 @@ import jakarta.validation.constraints.NotNull;
 
 import com.chris64233.cc.schemaregistry.compat.CompatibilityDiff;
 import com.chris64233.cc.schemaregistry.registry.CompatibilityMode;
+import com.chris64233.cc.schemaregistry.registry.MigrationBatchStatus;
+import com.chris64233.cc.schemaregistry.registry.MigrationMemberStatus;
 import com.chris64233.cc.schemaregistry.registry.VersionLifecycle;
 
 import tools.jackson.databind.JsonNode;
@@ -75,6 +77,29 @@ final class Dto {
     }
 
     record ScanResponse(int deprecatedVersions) {
+    }
+
+    record CreateMigrationBatchRequest(@NotNull Integer sourceVersion, @NotNull Integer targetVersion) {
+    }
+
+    record MigrationConfirmationRequest(@NotBlank String consumer, @NotBlank String eventId,
+            Integer targetVersion) {
+    }
+
+    record MigrationBatchMemberResponse(String consumer, int frozenVersion, int currentVersion,
+            Instant leaseExpiresAt, MigrationMemberStatus status, Instant resolvedAt) {
+    }
+
+    record MigrationConfirmationResponse(String consumer, int targetVersion, String eventId,
+            Instant confirmedAt) {
+    }
+
+    record MigrationBatchResponse(String subject, int batchNo, int sourceVersion, int targetVersion,
+            MigrationBatchStatus status, Instant createdAt, Instant completedAt, Instant cancelledAt,
+            List<MigrationBatchMemberResponse> pendingConsumers,
+            List<MigrationBatchMemberResponse> confirmedConsumers,
+            List<MigrationBatchMemberResponse> removedConsumers,
+            List<MigrationConfirmationResponse> confirmations, List<String> sourceBlockReasons) {
     }
 
     record ErrorResponse(String code, String message, List<String> details, List<CompatibilityDiff> diffs) {

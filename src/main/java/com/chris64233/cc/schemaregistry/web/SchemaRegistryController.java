@@ -21,6 +21,9 @@ import com.chris64233.cc.schemaregistry.registry.SchemaRegistryService.DeleteEli
 import com.chris64233.cc.schemaregistry.registry.SchemaRegistryService.DeleteResult;
 import com.chris64233.cc.schemaregistry.registry.SchemaRegistryService.DeprecationResult;
 import com.chris64233.cc.schemaregistry.registry.SchemaRegistryService.LifecycleView;
+import com.chris64233.cc.schemaregistry.registry.SchemaRegistryService.MigrationBatchView;
+import com.chris64233.cc.schemaregistry.registry.SchemaRegistryService.MemberView;
+import com.chris64233.cc.schemaregistry.registry.SchemaRegistryService.ConfirmationView;
 import com.chris64233.cc.schemaregistry.registry.SchemaRegistryService.PublishResult;
 import com.chris64233.cc.schemaregistry.registry.SchemaVersionEntity;
 import com.chris64233.cc.schemaregistry.registry.SubjectEntity;
@@ -141,6 +144,63 @@ public class SchemaRegistryController {
     @PostMapping("/deprecation-scans")
     public Dto.ScanResponse scanDeprecations() {
         return new Dto.ScanResponse(service.scanDeprecations());
+    }
+
+    @PostMapping("/{name}/migration-batches")
+    public ResponseEntity<Dto.MigrationBatchResponse> createMigrationBatch(@PathVariable String name,
+            @Validated @RequestBody Dto.CreateMigrationBatchRequest request,
+            @RequestHeader(value = "Idempotency-Key", required = false) String idempotencyKey) {
+        SchemaRegistryService.MigrationBatchCreation result = service.createMigrationBatch(name,
+                new SchemaRegistryService.MigrationBatchRequest(request.sourceVersion(),
+                        request.targetVersion(), idempotencyKey));
+        return ResponseEntity.status(result.created() ? HttpStatus.CREATED : HttpStatus.OK)
+                .body(toMigrationBatchResponse(result.batch()));
+    }
+
+    @GetMapping("/{name}/migration-batches")
+    public List<Dto.MigrationBatchResponse> listMigrationBatches(@PathVariable String name) {
+        return service.listMigrationBatches(name).stream().map(this::toMigrationBatchResponse).toList();
+    }
+
+    @GetMapping("/{name}/migration-batches/{batchNo}")
+    public Dto.MigrationBatchResponse getMigrationBatch(@PathVariable String name,
+            @PathVariable int batchNo) {
+        return toMigrationBatchResponse(service.getMigrationBatch(name, batchNo));
+    }
+
+    @PostMapping("/{name}/migration-batches/{batchNo}/confirmations")
+    public Dto.MigrationBatchResponse confirmMigration(@PathVariable String name,
+            @PathVariable int batchNo,
+            @Validated @RequestBody Dto.MigrationConfirmationRequest request) {
+        return toMigrationBatchResponse(service.confirmMigration(name, batchNo,
+                new SchemaRegistryService.MigrationConfirmationRequest(request.consumer(), request.eventId(),
+                        request.targetVersion())));
+    }
+
+    @PostMapping("/{name}/migration-batches/{batchNo}/cancellations")
+    public Dto.MigrationBatchResponse cancelMigrationBatch(@PathVariable String name,
+            @PathVariable int batchNo) {
+        return toMigrationBatchResponse(service.cancelMigrationBatch(name, batchNo));
+    }
+
+    private Dto.MigrationBatchResponse toMigrationBatchResponse(MigrationBatchView b) {
+        return new Dto.MigrationBatchResponse(b.subject(), b.batchNo(), b.sourceVersion(), b.targetVersion(),
+                b.status(), b.createdAt(), b.completedAt(), b.cancelledAt(),
+                b.pendingConsumers().stream().map(this::toMemberResponse).toList(),
+                b.confirmedConsumers().stream().map(this::toMemberResponse).toList(),
+                b.removedConsumers().stream().map(this::toMemberResponse).toList(),
+                b.confirmations().stream().map(this::toConfirmationResponse).toList(),
+                b.sourceBlockReasons());
+    }
+
+    private Dto.MigrationBatchMemberResponse toMemberResponse(MemberView m) {
+        return new Dto.MigrationBatchMemberResponse(m.consumer(), m.frozenVersion(), m.currentVersion(),
+                m.leaseExpiresAt(), m.status(), m.resolvedAt());
+    }
+
+    private Dto.MigrationConfirmationResponse toConfirmationResponse(ConfirmationView c) {
+        return new Dto.MigrationConfirmationResponse(c.consumer(), c.targetVersion(), c.eventId(),
+                c.confirmedAt());
     }
 
     private Dto.SubjectResponse toSubjectResponse(SubjectEntity subject) {
